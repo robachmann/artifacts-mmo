@@ -1,0 +1,18 @@
+version: 0.1
+default:
+  deploy:
+    parameters:
+      stack_name: artifacts-mmo
+      resolve_s3: true
+      s3_prefix: artifacts-mmo
+      region: us-west-2
+      confirm_changeset: true
+      capabilities: CAPABILITY_NAMED_IAM
+      parameter_overrides: # format: Parameter=Value, e.g. SubnetId=subnet-00000000000000000
+        - PlayerToken=
+        - CharacterNames=
+        - TelegramBotToken=
+        - TelegramChatId=
+        - NotifyItemDropCodes=
+        - SubnetId=
+        - DlqAlertEmailRecipient=

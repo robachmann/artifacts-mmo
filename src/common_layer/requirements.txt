@@ -1,0 +1,16 @@
+#boto3==1.42.25
+#isodate==0.7.2
+prometheus-client==0.25.0
+#python-dateutil==2.9.0.post0
+python-telegram-bot==22.7
+# pytz==2025.2
+requests==2.33.1
+scipy==1.17.1
+tenacity==9.1.4
+#urllib3<2
+xxhash==3.7.0
+
+# required for local development only
+colorlog==6.10.1
+load-dotenv==0.1.0
+python-dotenv==1.2.2

@@ -1,0 +1,44 @@
+{
+  "commands": [
+    {
+      "command": "status",
+      "description": "Get the current status"
+    },
+    {
+      "command": "dispatch",
+      "description": "Trigger the dispatch function"
+    },
+    {
+      "command": "leaders",
+      "description": "Get the leaderboard of achievements"
+    },
+    {
+      "command": "achievements",
+      "description": "Get the progress of unfinished achievements"
+    },
+    {
+      "command": "bank",
+      "description": "Get bank details"
+    },
+    {
+      "command": "events",
+      "description": "Display active events"
+    },
+    {
+      "command": "levels",
+      "description": "List all characters' levels"
+    },
+    {
+      "command": "tools",
+      "description": "List all tools and their available quantity"
+    },
+    {
+      "command": "matrix",
+      "description": "Print fight matrix"
+    },
+    {
+      "command": "reservations",
+      "description": "List all bank reservations"
+    }
+  ]
+}

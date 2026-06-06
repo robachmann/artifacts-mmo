@@ -1,0 +1,40 @@
+# ----------------------
+# General Settings
+# ----------------------
+line-length = 145
+exclude = [
+    'src/common_layer/artifactsmmo/models',
+    'src/common_layer/artifactsmmo/typing_utils.py',
+    'src/common_layer/artifactsmmo/util.py'
+]
+
+# ----------------------
+# Linting Rules
+# ----------------------
+[lint]
+# Enable linting rules: imports, unused code, and style
+select = ["I", "F", "E", "W"]
+
+# ----------------------
+# Formatting Settings
+# ----------------------
+[format]
+quote-style = 'single'
+
+# ----------------------
+# Import Sorting (isort-like behavior)
+# ----------------------
+[lint.isort]
+known-first-party = ["src", "artifactsmmo"]  # Adjust if your root package is different
+combine-as-imports = true
+force-sort-within-sections = true
+#single-line-exclusions = []
+order-by-type = false
+# lines-between-types = 1  # Removed, since Ruff ignores it when force-sort-within-sections = true
+section-order = [
+    "future",
+    "standard-library",
+    "third-party",
+    "first-party",
+    "local-folder"
+]

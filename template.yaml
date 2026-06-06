@@ -1,0 +1,958 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  SAM template to play the Artifacts MMO (https://artifactsmmo.com/)
+
+Parameters:
+  PlayerToken:
+    Type: String
+    Default: ''
+    NoEcho: true
+  AccountName:
+    Type: String
+    Default: ''
+    Description: "Your player's account name"
+  CharacterNames:
+    Type: String
+    Default: ''
+    Description: 'Comma-separated list of character names, e.g. character-1,character-2,character-3,character-4,character-5'
+  TelegramBotToken:
+    Type: String
+    Default: ''
+    NoEcho: true
+  TelegramChatId:
+    Type: String
+    Default: ''
+    NoEcho: true
+  NotifyItemDropCodes:
+    Type: String
+    Default: ''
+    Description: 'Comma-separated list of item_codes of which the player should be notified when received'
+  SubnetId:
+    Type: String
+    Default: ''
+    Description: 'Subnet name for the ECS task, including "subnet-" prefix'
+  DlqAlertEmailRecipient:
+    Type: String
+    Default: ''
+  ApiBaseUrl:
+    Type: String
+    Default: 'https://api.artifactsmmo.com'
+    AllowedValues:
+      - 'https://api.artifactsmmo.com'
+      - 'https://api-test.artifactsmmo.com'
+      - 'https://sandbox-api.artifactsmmo.com'
+      - 'https://api.beta.artifactsmmo.com'
+  PlayerTimezone:
+    Type: String
+    Default: 'Europe/Zurich'
+    Description: 'Timezone of the player, important for the scheduler and notifications'
+
+Globals:
+  Function:
+    Runtime: python3.13
+    Timeout: 890
+    MemorySize: 128
+    RecursiveLoop: Allow
+    Environment:
+      Variables:
+        PLAYER_TOKEN: !Ref PlayerToken
+        CHARACTER_NAMES: !Ref CharacterNames
+        ACCOUNT_NAME: !Ref AccountName
+        TELEGRAM_BOT_TOKEN: !Ref TelegramBotToken
+        TELEGRAM_CHAT_ID: !Ref TelegramChatId
+        DROP_CODES: !Ref NotifyItemDropCodes
+        BASE_URL: !Ref ApiBaseUrl
+        PLAYER_TIME_ZONE: !Ref PlayerTimezone
+    Architectures:
+      - arm64
+    Layers:
+      - !Ref LambdaLayer
+      - !Sub 'arn:aws:lambda:${AWS::Region}:017000801446:layer:AWSLambdaPowertoolsPythonV3-python313-arm64:4'
+    Tags:
+      InspectorExclusion: LambdaCodeScanning
+
+Conditions:
+  DeployWebsocketContainer: !Not [ !Equals [ !Ref SubnetId, '' ] ]
+
+Resources:
+
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Condition: DeployWebsocketContainer
+    Properties:
+      ClusterName: !Sub '${AWS::StackName}-websocket-cluster'
+
+  ECSTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Condition: DeployWebsocketContainer
+    Properties:
+      Family: !Sub '${AWS::StackName}-websocket-task-definition'
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: 256
+      Memory: 512
+      ExecutionRoleArn: !Ref ECSTaskExecutionRole
+      RuntimePlatform:
+        OperatingSystemFamily: LINUX
+        CpuArchitecture: ARM64
+      ContainerDefinitions:
+        - Name: !Sub '${AWS::StackName}-websocket-container'
+          Image: robachmann/artifactsmmo-websocket-container:1.4.0
+          Environment:
+            - Name: PLAYER_TOKEN
+              Value: !Ref PlayerToken
+            - Name: WEBHOOK_URL
+              Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/prod/webhook'
+            - Name: SUBSCRIPTIONS
+              Value: 'version,event_spawn,event_removed,grandexchange_sell_order,grandexchange_buy_order,grandexchange_buy,grandexchange_sell,pending_item_received,announcement,achievement_unlocked,account_log,test'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref CloudWatchLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  ECSService:
+    Type: AWS::ECS::Service
+    Condition: DeployWebsocketContainer
+    Properties:
+      ServiceName: !Sub '${AWS::StackName}-websocket-service'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref ECSTaskDefinition
+      DesiredCount: 1
+      CapacityProviderStrategy:
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 1
+        - CapacityProvider: FARGATE
+          Weight: 0 # Optional: Ensures no usage of standard Fargate
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref SubnetId
+
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: DeployWebsocketContainer
+    Properties:
+      RoleName: !Sub '${AWS::Region}-${AWS::AccountId}-${AWS::StackName}-ecs-task-exec-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  CloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: DeployWebsocketContainer
+    Properties:
+      LogGroupName: !Sub '/ecs/${AWS::StackName}-websocket-container'
+      RetentionInDays: 3
+
+  DispatcherFunction:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-dispatcher-function'
+      CodeUri: src/dispatcher-function
+      Handler: app.handler
+      ReservedConcurrentExecutions: 1
+      Environment:
+        Variables:
+          POWERTOOLS_SERVICE_NAME: 'dispatcher-function'
+          WORKER_QUEUE_URL: !Ref WorkerQueue
+          CHARACTER_TABLE_NAME: !Ref CharacterTable
+          BANK_RESERVATIONS_TABLE_NAME: !Ref BankReservationsTable
+          EQUIPMENT_LOCK_TABLE_NAME: !Ref EquipmentLockTable
+          SKIP_EVENTS_TABLE_NAME: !Ref SkipEventsTable
+          COUNTERS_TABLE_NAME: !Ref CountersTable
+          LOGS_TABLE_NAME: !Ref LogsTable
+      Events:
+        Queue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt DispatcherQueue.Arn
+        EventScheduler:
+          Type: ScheduleV2
+          Properties:
+            Name: !Sub '${AWS::StackName}-dispatcher-scheduler'
+            State: ENABLED
+            ScheduleExpression: cron(*/10 * * * ? *)
+            ScheduleExpressionTimezone: !Ref PlayerTimezone
+            RetryPolicy:
+              MaximumRetryAttempts: 0
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt WorkerQueue.QueueName
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CharacterTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BankReservationsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EquipmentLockTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SkipEventsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CountersTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref LogsTable
+
+  DispatcherFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${DispatcherFunction}'
+      RetentionInDays: 3
+
+  TelegramFunction:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-telegram-function'
+      CodeUri: src/telegram-function
+      Handler: app.handler
+      ReservedConcurrentExecutions: 2
+      MemorySize: 512
+      Environment:
+        Variables:
+          POWERTOOLS_SERVICE_NAME: 'telegram-function'
+          DISPATCHER_QUEUE_URL: !Ref DispatcherQueue
+          WORKER_QUEUE_URL: !Ref WorkerQueue
+          CHARACTER_TABLE_NAME: !Ref CharacterTable
+          TASK_PROGRESS_TABLE_NAME: !Ref TaskProgressTable
+          LOGS_TABLE_NAME: !Ref LogsTable
+          BANK_RESERVATIONS_TABLE_NAME: !Ref BankReservationsTable
+          WITHDRAW_TABLE_NAME: !Ref WithdrawTable
+          FOLLOWER_SUBSCRIPTIONS_TABLE_NAME: !Ref FollowerSubscriptionsTable
+          SKILL_STATS_TABLE_NAME: !Ref SkillStatsTable
+      Events:
+        Queue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt TelegramQueue.Arn
+            BatchSize: 1
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt DispatcherQueue.QueueName
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt WorkerQueue.QueueName
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CharacterTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TaskProgressTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref LogsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BankReservationsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref WithdrawTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref FollowerSubscriptionsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SkillStatsTable
+
+  TelegramFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${TelegramFunction}'
+      RetentionInDays: 3
+
+  WebhookFunction:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-webhook-function'
+      CodeUri: src/webhook-function
+      Handler: app.handler
+      ReservedConcurrentExecutions: 5
+      Environment:
+        Variables:
+          POWERTOOLS_SERVICE_NAME: 'webhook-function'
+          DISPATCHER_QUEUE_URL: !Ref DispatcherQueue
+          LOGS_TABLE_NAME: !Ref LogsTable
+          FOLLOWER_SUBSCRIPTIONS_TABLE_NAME: !Ref FollowerSubscriptionsTable
+          CHARACTER_TABLE_NAME: !Ref CharacterTable
+      Events:
+        Queue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt WebhookQueue.Arn
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt DispatcherQueue.QueueName
+        - DynamoDBCrudPolicy:
+            TableName: !Ref LogsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref FollowerSubscriptionsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CharacterTable
+
+  WebhookFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${WebhookFunction}'
+      RetentionInDays: 3
+
+  WorkerFunction:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-worker-function'
+      CodeUri: src/worker-function
+      Handler: app.handler
+      ReservedConcurrentExecutions: 5
+      MemorySize: 320
+      Environment:
+        Variables:
+          POWERTOOLS_SERVICE_NAME: 'worker-function'
+          WORKER_QUEUE_URL: !Ref WorkerQueue
+          DISPATCHER_QUEUE_URL: !Ref DispatcherQueue
+          LOG_AGGREGATOR_TOPIC_ARN: !Ref LogAggregatorTopic
+          CHARACTER_TABLE_NAME: !Ref CharacterTable
+          TASK_PROGRESS_TABLE_NAME: !Ref TaskProgressTable
+          LOGS_TABLE_NAME: !Ref LogsTable
+          SKILL_STATS_TABLE_NAME: !Ref SkillStatsTable
+          BANK_RESERVATIONS_TABLE_NAME: !Ref BankReservationsTable
+          EQUIPMENT_LOCK_TABLE_NAME: !Ref EquipmentLockTable
+          SKIP_EVENTS_TABLE_NAME: !Ref SkipEventsTable
+          WITHDRAW_TABLE_NAME: !Ref WithdrawTable
+          COUNTERS_TABLE_NAME: !Ref CountersTable
+          PROCESSED_MESSAGES_TABLE_NAME: !Ref ProcessedMessagesTable
+          FIGHT_SIMULATOR_QUEUE_URL: !Ref FightSimulatorQueue
+          FIGHT_SIMULATOR_TABLE_NAME: !Ref FightSimulatorTable
+      Events:
+        Queue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt WorkerQueue.Arn
+            BatchSize: 1
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt WorkerQueue.QueueName
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt DispatcherQueue.QueueName
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt FightSimulatorQueue.QueueName
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt LogAggregatorTopic.TopicName
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CharacterTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TaskProgressTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref LogsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SkillStatsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BankReservationsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EquipmentLockTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SkipEventsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref WithdrawTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CountersTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ProcessedMessagesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref FightSimulatorTable
+
+  WorkerFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${WorkerFunction}'
+      RetentionInDays: 3
+
+  FightSimulatorFunction:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-fight-simulator-function'
+      CodeUri: src/fight-simulator-function
+      Handler: app.handler
+      ReservedConcurrentExecutions: 1
+      MemorySize: 1024
+      Environment:
+        Variables:
+          POWERTOOLS_SERVICE_NAME: 'fight-simulator-function'
+          FIGHT_SIMULATOR_TABLE_NAME: !Ref FightSimulatorTable
+          BANK_RESERVATIONS_TABLE_NAME: !Ref BankReservationsTable
+          WORKER_QUEUE_URL: !Ref WorkerQueue
+      Events:
+        Queue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt FightSimulatorQueue.Arn
+            BatchSize: 1
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref FightSimulatorTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BankReservationsTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt WorkerQueue.QueueName
+
+  FightSimulatorFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${FightSimulatorFunction}'
+      RetentionInDays: 3
+
+  LogAggregatorFunction:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-log-aggregator-function'
+      CodeUri: src/log-aggregator-function
+      Handler: app.handler
+      ReservedConcurrentExecutions: 5
+      Environment:
+        Variables:
+          POWERTOOLS_SERVICE_NAME: 'log-aggregator-function'
+          LOGS_TABLE_NAME: !Ref LogsTable
+          FOLLOWER_SUBSCRIPTIONS_TABLE_NAME: !Ref FollowerSubscriptionsTable
+          CHARACTER_TABLE_NAME: !Ref CharacterTable
+      Events:
+        SNSTopic:
+          Type: SNS
+          Properties:
+            Topic: !Ref LogAggregatorTopic
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref LogsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref FollowerSubscriptionsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CharacterTable
+
+  LogAggregatorFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${LogAggregatorFunction}'
+      RetentionInDays: 3
+
+  MetricsExporterFunction:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-metrics-exporter-function'
+      CodeUri: src/metrics-exporter-function
+      Handler: app.handler
+      ReservedConcurrentExecutions: 1
+      Environment:
+        Variables:
+          POWERTOOLS_SERVICE_NAME: 'metrics-exporter-function'
+          BUCKET_NAME: !Ref MetricsBucket
+          BANK_RESERVATIONS_TABLE_NAME: !Ref BankReservationsTable
+          COUNTERS_TABLE_NAME: !Ref CountersTable
+      Events:
+        EventScheduler:
+          Type: ScheduleV2
+          Properties:
+            Name: !Sub '${AWS::StackName}-metrics-exporter-scheduler'
+            State: ENABLED
+            ScheduleExpression: rate(10 minutes)
+            RetryPolicy:
+              MaximumRetryAttempts: 0
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref MetricsBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BankReservationsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CountersTable
+
+  MetricsExporterLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${MetricsExporterFunction}'
+      RetentionInDays: 3
+
+  MetricsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::Region}-${AWS::AccountId}-${AWS::StackName}-metrics-bucket'
+
+  HttpApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::Region}-${AWS::AccountId}-${AWS::StackName}-http-api-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${AWS::Region}-${AWS::AccountId}-${AWS::StackName}-http-api-sqs-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource:
+                  - !GetAtt TelegramQueue.Arn
+                  - !GetAtt WebhookQueue.Arn
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: prod
+      DefinitionBody:
+        openapi: '3.0.1'
+        info:
+          title: !Sub '${AWS::StackName}-http-api'
+        paths:
+          /telegram:
+            post:
+              x-amazon-apigateway-integration:
+                integrationSubtype: SQS-SendMessage
+                credentials: !GetAtt HttpApiRole.Arn
+                requestParameters:
+                  QueueUrl: !Ref TelegramQueue
+                  MessageBody: $request.body
+                payloadFormatVersion: '1.0'
+                type: aws_proxy
+          /webhook:
+            post:
+              x-amazon-apigateway-integration:
+                integrationSubtype: SQS-SendMessage
+                credentials: !GetAtt HttpApiRole.Arn
+                requestParameters:
+                  QueueUrl: !Ref WebhookQueue
+                  MessageBody: $request.body
+                payloadFormatVersion: '1.0'
+                type: aws_proxy
+
+  MetricsRestApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub '${AWS::StackName}-rest-api'
+      StageName: prod
+      EndpointConfiguration:
+        Type: REGIONAL
+      BinaryMediaTypes:
+        - '*/*'
+      DefinitionBody:
+        openapi: '3.0.1'
+        info: { }
+        paths:
+          /metrics/{object}:
+            get:
+              parameters:
+                - name: object
+                  in: path
+                  required: true
+                  schema:
+                    type: string
+              x-amazon-apigateway-integration:
+                type: "aws"
+                httpMethod: "GET"
+                requestParameters:
+                  'integration.request.path.object': 'method.request.path.object'
+                uri: !Sub "arn:aws:apigateway:${AWS::Region}:s3:path/${MetricsBucket}/{object}"
+                passthroughBehavior: "when_no_match"
+                timeoutInMillis: 29000
+                credentials: !GetAtt ApiGatewayRole.Arn
+                responses:
+                  default:
+                    statusCode: 200
+                    responseParameters:
+                      method.response.header.Content-Type: "integration.response.header.Content-Type"
+                      method.response.header.Content-Encoding: "integration.response.header.Content-Encoding"
+                      method.response.header.Cache-Control: "integration.response.header.Cache-Control"
+              responses:
+                '200':
+                  description: 200 response
+                  headers:
+                    Content-Type:
+                      schema:
+                        type: string
+                    Content-Encoding:
+                      schema:
+                        type: string
+                    Cache-Control:
+                      schema:
+                        type: string
+
+  ApiGatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::Region}-${AWS::AccountId}-${AWS::StackName}-rest-api-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${AWS::Region}-${AWS::AccountId}-${AWS::StackName}-rest-api-s3-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt MetricsBucket.Arn
+                  - !Sub "${MetricsBucket.Arn}/*"
+
+  TelegramQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-telegram-queue'
+      VisibilityTimeout: 890
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt TelegramQueueDLQ.Arn
+        maxReceiveCount: 1
+      MessageRetentionPeriod: 345600
+
+  TelegramQueueDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-telegram-queue-dlq'
+      MessageRetentionPeriod: 1209600
+
+  WebhookQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-webhook-queue'
+      VisibilityTimeout: 890
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt WebhookQueueDLQ.Arn
+        maxReceiveCount: 2
+      MessageRetentionPeriod: 345600
+
+  WebhookQueueDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-webhook-queue-dlq'
+      MessageRetentionPeriod: 1209600
+
+  WorkerQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-worker-queue'
+      VisibilityTimeout: 890
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt WorkerQueueDLQ.Arn
+        maxReceiveCount: 1
+      MessageRetentionPeriod: 345600
+
+  WorkerQueueDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-worker-queue-dlq'
+      MessageRetentionPeriod: 1209600
+
+  FightSimulatorQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-fight-simulator-queue'
+      VisibilityTimeout: 890
+      MessageRetentionPeriod: 345600
+
+  DispatcherQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-dispatcher-queue'
+      VisibilityTimeout: 890
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DispatcherQueueDLQ.Arn
+        maxReceiveCount: 1
+      MessageRetentionPeriod: 345600
+
+  DispatcherQueueDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-dispatcher-queue-dlq'
+      MessageRetentionPeriod: 1209600
+
+  LogAggregatorTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-log-aggregator-topic'
+
+  WithdrawTable:
+    Type: AWS::Serverless::SimpleTable
+    Properties:
+      TableName: !Sub '${AWS::StackName}-withdraw-table'
+      PrimaryKey:
+        Name: item
+        Type: String
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+
+  FightSimulatorTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-fight-simulator-table'
+      AttributeDefinitions:
+        - AttributeName: fight_simulator_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: fight_simulator_id
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+      TimeToLiveSpecification:
+        AttributeName: delete_at_ts
+        Enabled: true
+
+  CountersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-counters-table'
+      AttributeDefinitions:
+        - AttributeName: code
+          AttributeType: S
+        - AttributeName: type
+          AttributeType: S
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+      KeySchema:
+        - AttributeName: code
+          KeyType: HASH
+        - AttributeName: type
+          KeyType: RANGE
+
+  CharacterTable:
+    Type: AWS::Serverless::SimpleTable
+    Properties:
+      TableName: !Sub '${AWS::StackName}-character-table'
+      PrimaryKey:
+        Name: character_name
+        Type: String
+      ProvisionedThroughput:
+        ReadCapacityUnits: 4
+        WriteCapacityUnits: 5
+
+  TaskProgressTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-task-progress-table'
+      AttributeDefinitions:
+        - AttributeName: quest_id
+          AttributeType: S
+        - AttributeName: drop_item
+          AttributeType: S
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+      KeySchema:
+        - AttributeName: quest_id
+          KeyType: HASH
+        - AttributeName: drop_item
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: delete_at_ts
+        Enabled: true
+
+  ProcessedMessagesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-processed-messages-table'
+      AttributeDefinitions:
+        - AttributeName: message_id
+          AttributeType: S
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+      KeySchema:
+        - AttributeName: message_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: delete_at_ts
+        Enabled: true
+
+  EquipmentLockTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-equipment-lock-table'
+      AttributeDefinitions:
+        - AttributeName: lock_id
+          AttributeType: S
+      ProvisionedThroughput:
+        ReadCapacityUnits: 2
+        WriteCapacityUnits: 1
+      KeySchema:
+        - AttributeName: lock_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: delete_at_ts
+        Enabled: true
+
+  LogsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-logs-table'
+      AttributeDefinitions:
+        - AttributeName: character_name
+          AttributeType: S
+        - AttributeName: created_ts
+          AttributeType: N
+      ProvisionedThroughput:
+        ReadCapacityUnits: 7
+        WriteCapacityUnits: 1
+      KeySchema:
+        - AttributeName: character_name
+          KeyType: HASH
+        - AttributeName: created_ts
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: delete_at_ts
+        Enabled: true
+
+  SkipEventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-skip-events-table'
+      AttributeDefinitions:
+        - AttributeName: character_name
+          AttributeType: S
+        - AttributeName: event_name
+          AttributeType: S
+      ProvisionedThroughput:
+        ReadCapacityUnits: 2
+        WriteCapacityUnits: 1
+      KeySchema:
+        - AttributeName: character_name
+          KeyType: HASH
+        - AttributeName: event_name
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: delete_at_ts
+        Enabled: true
+
+  SkillStatsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-skill-stats-table'
+      AttributeDefinitions:
+        - AttributeName: 'action.skill'
+          AttributeType: S
+        - AttributeName: 'level.subject'
+          AttributeType: S
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+      KeySchema:
+        - AttributeName: 'action.skill'
+          KeyType: HASH
+        - AttributeName: 'level.subject'
+          KeyType: RANGE
+
+  BankReservationsTable:
+    Type: AWS::Serverless::SimpleTable
+    Properties:
+      TableName: !Sub '${AWS::StackName}-bank-reservations-table'
+      PrimaryKey:
+        Name: reservations
+        Type: String
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+
+  FollowerSubscriptionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-follower-subscriptions-table'
+      AttributeDefinitions:
+        - AttributeName: character_name
+          AttributeType: S
+        - AttributeName: subscription_type
+          AttributeType: S
+        - AttributeName: static_partition
+          AttributeType: S
+      KeySchema:
+        - AttributeName: character_name
+          KeyType: HASH
+        - AttributeName: subscription_type
+          KeyType: RANGE
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+      GlobalSecondaryIndexes:
+        - IndexName: all-subscriptions-index
+          KeySchema:
+            - AttributeName: static_partition
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: 1
+            WriteCapacityUnits: 1
+      TimeToLiveSpecification:
+        AttributeName: delete_at_ts
+        Enabled: true
+
+  CloudwatchTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref DlqAlertEmailRecipient
+
+  DLQMessageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "Trigger an alarm when the DLQ has at least one message."
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt WorkerQueueDLQ.QueueName
+      AlarmActions:
+        - !Ref CloudwatchTopic
+
+  LambdaLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub '${AWS::StackName}-lambda-layer'
+      ContentUri: src/common_layer
+      CompatibleRuntimes:
+        - python3.13
+      CompatibleArchitectures:
+        - arm64
+      RetentionPolicy: Delete
+    Metadata:
+      BuildMethod: python3.13
+      BuildArchitecture: arm64
+
+Outputs:
+  DispatcherFunction:
+    Description: CLI command to start the dispatcher function
+    Value: !Sub 'aws lambda invoke --function-name ${DispatcherFunction} --cli-binary-format raw-in-base64-out --profile --region ${AWS::Region}'
+  MetricsBucket:
+    Description: URL of metrics
+    Value: !Sub 'https://${MetricsRestApi}.execute-api.${AWS::Region}.amazonaws.com/prod/metrics/metrics.prom'
+  TelegramBot:
+    Description: Set webhook target for Telegram bot integration
+    Value: !Sub 'http POST https://api.telegram.org/bot${TelegramBotToken}/setWebhook url==https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/prod/telegram -v'
+  Webhook:
+    Description: Forward Events to this webhook
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/prod/webhook'
